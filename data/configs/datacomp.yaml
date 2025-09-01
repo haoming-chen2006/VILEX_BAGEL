@@ -1,0 +1,13 @@
+defaults:
+  - /dataset: datacomp
+train:
+  _target_: vilex.dataset.WebDataset
+  shards: /datasets/datacomp/current/recap_datacomp_1b_data/{00000..97000}.tar
+  shuffle_buffer_size: 10000
+  image_size: 256
+
+validation:
+  _target_: vilex.dataset.WebDataset
+  shards: /datasets/datacomp/current/recap_datacomp_1b_data/{97000..97166}.tar
+  shuffle_buffer_size: null
+  image_size: 256

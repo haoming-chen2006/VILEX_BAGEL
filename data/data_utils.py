@@ -82,6 +82,7 @@ def prepare_attention_mask_per_sample(split_lens, attn_modes, device="cpu"):
     for s, attn_mode in zip(split_lens, attn_modes):
         assert attn_mode in ['causal', 'full', 'noise']
         if attn_mode == "causal":
+            print("using causal masks!")
             attention_mask[csum:csum + s, csum:csum + s] = torch.ones((s, s), device=device).tril()
             attention_mask[csum:csum + s, :csum] = 1
         else:

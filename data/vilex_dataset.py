@@ -8,14 +8,31 @@ from torch.utils.data import DataLoader
 from omegaconf import OmegaConf
 from modeling.qwen2 import Qwen2Tokenizer
 from modeling.autoencoder import load_ae
-from data.data_utils import add_special_tokens
-
+from data.data_utils import (
+    get_flattened_position_ids_interpolate,
+    get_flattened_position_ids_extrapolate, 
+    len2weight,
+    patchify, 
+    add_special_tokens
+)
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import os
+import math
 
 
 # Todos:
-# 1. masking: manually assign special tokens casual masks or no? -- remove image start/iomage end added to vilex, include image start/end added to bagel
-# 2. Loss computation: look into loss and make suree it worked
-# 3. Get a test run: load this data, put into model, and see how it goes
+# 1. look at vilex dataloader and understand -- Done
+# 2. Maintaining the same output structure, but use vilex dataloading + smaller dataset -- Done
+# 3. Diagnose output attention and loss graphs
+# 4/ 
+
+
+
+
+
+
+
 
 
 class VilexDataset(torch.utils.data.IterableDataset):
@@ -31,15 +48,15 @@ class VilexDataset(torch.utils.data.IterableDataset):
         tokenizer,
         special_tokens,
         vae_model=None,
-        image_size=512,
-        vae_image_downsample=16,
-        vit_patch_size=16,
+        max_image_size=512,  # Changed from image_size to max_image_size
+        vae_image_downsample=64,
+        vit_patch_size=14,
         max_sequence_length=4096,
         shuffle_buffer_size=1000,
     ):
         self.tokenizer = tokenizer
         self.vae_model = vae_model
-        self.image_size = image_size
+        self.max_image_size = max_image_size
         self.vae_image_downsample = vae_image_downsample
         self.vit_patch_size = vit_patch_size
         self.max_sequence_length = max_sequence_length
@@ -48,10 +65,15 @@ class VilexDataset(torch.utils.data.IterableDataset):
         for k, v in special_tokens.items():
             setattr(self, k, v)
             
-        # Image transform
+        # Calculate actual image size (divisible by patch_size) -- originally just resizes to vae or vit, now resize to the lcm of both
+        lcm_size = math.lcm(vit_patch_size, vae_image_downsample)
+        self.actual_image_size = (max_image_size // lcm_size) * lcm_size
+        print(f"Adjusted image size from {max_image_size} to {self.actual_image_size} (divisible by LCM({vit_patch_size}, {vae_image_downsample}) = {lcm_size})")
+        
+        # Image transform with dynamic sizing
         self.transform = T.Compose([
-            T.Resize(image_size),
-            T.CenterCrop(image_size),
+            T.Resize(self.actual_image_size),
+            T.CenterCrop(self.actual_image_size),
             T.ToTensor(),
             T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  
         ])
@@ -109,7 +131,7 @@ class VilexDataset(torch.utils.data.IterableDataset):
         )
     
     def _pack_sequence(self, text_tokens, image_tensor, vit_patches, 
-                            vae_h, vae_w, num_vit_patches, num_vae_tokens):
+                            vae_h, vae_w, num_vit_patches, num_vae_tokens,num_queries = 32):
         """Pack sequence in fixed order: text + vit + vae
         also includes meta data of the indexes (where these tokens appear in the sequence)
         length of sequence, position ids of different indexes, loss indexes (which part is got to compute which loss)
@@ -139,24 +161,20 @@ class VilexDataset(torch.utils.data.IterableDataset):
         # 1. TEXT BLOCK
         text_split_len = 0
         
-        # Add BOS + text tokens
+        # Add BOS + text tokens + Eos
         shifted_text = [self.bos_token_id] + text_tokens
         packed_text_ids.extend(shifted_text)
         packed_text_indexes.extend(range(curr, curr + len(shifted_text)))
         
         # Text loss
         ce_loss_indexes.extend(range(curr, curr + len(shifted_text)))
-        ce_loss_weights.extend([1.0] * len(shifted_text))
-        packed_label_ids.extend(text_tokens + [self.eos_token_id])
-        
+        ce_loss_weights.extend([len2weight(len(shifted_text))] * len(shifted_text))
         curr += len(shifted_text)
         text_split_len += len(shifted_text)
+        packed_label_ids.extend([shifted_text])
+        # Add EOS token -- special token (eos token) currently disabled loss but could potentially have loss
+
         
-        # Add EOS token
-        packed_text_ids.append(self.eos_token_id)
-        packed_text_indexes.append(curr)
-        curr += 1
-        text_split_len += 1
         
         # Text uses sequential RoPE positions
         packed_position_ids.extend(range(rope_id, rope_id + text_split_len))
@@ -174,28 +192,32 @@ class VilexDataset(torch.utils.data.IterableDataset):
         # vit_split_len += 1
         
         # ViT tokens
-        packed_vit_token_indexes.extend(range(curr, curr + num_vit_patches))
+        packed_vit_token_indexes.extend(range(curr, curr + num_queries))
         packed_vit_tokens.append(vit_patches)
+        curr += num_queries
+        vit_split_len += num_queries
+
+        packed_vit_tokens.extend([self.eos_token_id])
+        packed_vit_token_indexes.append(curr)
+        curr += 1
+        vit_split_len += 1
         
+
         # ViT position IDs (2D flattened)
         h, w = image_tensor.shape[1:]
-        from data.data_utils import get_flattened_position_ids_extrapolate
         vit_pos_ids = get_flattened_position_ids_extrapolate(
-            h, w, self.vit_patch_size, max_num_patches_per_side=70
+            h, w, self.vit_patch_size, max_num_patches_per_side = 70
         )
         packed_vit_position_ids.append(vit_pos_ids)
         
-        curr += num_vit_patches
-        vit_split_len += num_vit_patches
-        
-        # End of image
+        # End of image -- currently not applied
         # packed_text_ids.append(self.end_of_image)
 
         # packed_text_indexes.append(curr)
         # curr += 1
         # vit_split_len += 1
         
-        # All ViT tokens get same RoPE position
+        # All ViT tokens get same RoPE position as text
 
         
         packed_position_ids.extend(range(rope_id, rope_id + vit_split_len))
@@ -217,7 +239,7 @@ class VilexDataset(torch.utils.data.IterableDataset):
         mse_loss_indexes.extend(range(curr, curr + num_vae_tokens))
         
         # Random timestep for diffusion
-        timestep = np.random.randint(0, 1000)
+        timestep = np.random.randint(0, 1000) # no bound?
         packed_timesteps.extend([timestep] * num_vae_tokens)
         
         curr += num_vae_tokens
@@ -230,7 +252,15 @@ class VilexDataset(torch.utils.data.IterableDataset):
         vae_split_len += 1
         
         # All VAE tokens get same RoPE position
+        packed_latent_position_ids = []
         packed_position_ids.extend([rope_id] * vae_split_len)
+        packed_latent_position_ids.append(
+                    get_flattened_position_ids_extrapolate(
+                        image_tensor.size(1), image_tensor.size(2),
+                        self.vae_image_downsample, 
+                        max_num_patches_per_side=70
+                    )
+                )
         rope_id += 1
         split_lens.append(vae_split_len)
         attn_modes.append("noise")  # For diffusion training
@@ -248,6 +278,7 @@ class VilexDataset(torch.utils.data.IterableDataset):
             'packed_vit_position_ids': torch.cat(packed_vit_position_ids, dim=0) if packed_vit_position_ids else torch.empty(0),
             'packed_vit_token_indexes': torch.tensor(packed_vit_token_indexes),
             'vit_token_seqlens': torch.tensor([num_vit_patches]),
+            'packed_latent_position_ids':torch.cat(packed_latent_position_ids, dim=0),
             
             # VAE data  
             'padded_images': image_tensor.unsqueeze(0),  # Add batch dim
@@ -262,11 +293,13 @@ class VilexDataset(torch.utils.data.IterableDataset):
             'ce_loss_weights': torch.tensor(ce_loss_weights),
             
             # Attention
+            "num_tokens": curr,
+            'split_lens': split_lens,
+            'attn_modes': attn_modes,
             'nested_attention_masks': [self._prepare_attention_mask(split_lens, attn_modes)],
             
             # Metadata
             'batch_data_indexes': [{'data_indexes': [0, 0, 0], 'worker_id': 0, 'dataset_name': 'simple'}],
-            'num_tokens': curr,
             'data_indexes': {'data_indexes': [0, 0, 0], 'worker_id': 0, 'dataset_name': 'simple'},
         }
     
@@ -278,7 +311,9 @@ class VilexDataset(torch.utils.data.IterableDataset):
     def __iter__(self):
         for sample in self.dataset:
             if sample['num_tokens'] <= self.max_sequence_length:
+                print("yielding sample with length" + str(sample["num_tokens"]))
                 yield sample
+                
 
 
 def create_loader(
@@ -348,11 +383,254 @@ def get_loader(split,tokenizer = None,special_tokens = None,vae_model = None, cf
 
 
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 
-def analyze_bagel_batch(batch, tokenizer=None, detailed=True):
+def visualize_attention_mask(mask, text_len, vit_len, vae_len, title="Attention Mask", save_path=None):
     """
-    Comprehensive analysis of a BAGEL batch with detailed statistics
+    Create a labeled heatmap of the attention mask
     """
+    text_len -= 2
+    vae_len +=2
+    fig, ax = plt.subplots(figsize=(12, 10))
+    
+    # Convert mask to numpy for visualization (0 = white, -inf = black)
+    mask_vis = mask.clone()
+    mask_vis[mask_vis == float('-inf')] = -1
+    mask_vis[mask_vis == 0] = 1
+    
+    # Create the heatmap
+    im = ax.imshow(mask_vis.numpy(), cmap='RdBu', vmin=-1, vmax=1, aspect='equal')
+    
+    # Add grid lines to separate sections
+    text_end = text_len
+    vit_end = text_len + vit_len
+    vae_end = text_len + vit_len + vae_len
+    
+    # Vertical lines
+    ax.axvline(x=text_end - 0.5, color='yellow', linewidth=2, alpha=0.8)
+    ax.axvline(x=vit_end - 0.5, color='yellow', linewidth=2, alpha=0.8)
+    
+    # Horizontal lines  
+    ax.axhline(y=text_end - 0.5, color='yellow', linewidth=2, alpha=0.8)
+    ax.axhline(y=vit_end - 0.5, color='yellow', linewidth=2, alpha=0.8)
+    
+    # Add section labels
+    ax.text(text_len//2, -2, 'TEXT', ha='center', fontweight='bold', fontsize=12)
+    ax.text(text_len + vit_len//2, -2, 'VIT', ha='center', fontweight='bold', fontsize=12)
+    ax.text(text_len + vit_len + vae_len//2, -2, 'VAE', ha='center', fontweight='bold', fontsize=12)
+    
+    ax.text(-2, text_len//2, 'TEXT', va='center', rotation=90, fontweight='bold', fontsize=12)
+    ax.text(-2, text_len + vit_len//2, 'VIT', va='center', rotation=90, fontweight='bold', fontsize=12)
+    ax.text(-2, text_len + vit_len + vae_len//2, 'VAE', va='center', rotation=90, fontweight='bold', fontsize=12)
+    
+    # Add tick labels for key positions
+    major_ticks = [0, text_end-1, text_end, vit_end-1, vit_end, vae_end-1]
+    major_labels = ['0', f'{text_end-1}', f'{text_end}', f'{vit_end-1}', f'{vit_end}', f'{vae_end-1}']
+    
+    ax.set_xticks(major_ticks)
+    ax.set_xticklabels(major_labels)
+    ax.set_yticks(major_ticks)
+    ax.set_yticklabels(major_labels)
+    
+    # Add minor ticks for every 10th position if sequence is long
+    if vae_end > 20:
+        minor_ticks = list(range(0, vae_end, max(1, vae_end//10)))
+        ax.set_xticks(minor_ticks, minor=True)
+        ax.set_yticks(minor_ticks, minor=True)
+        ax.grid(True, which='minor', alpha=0.3)
+    
+    ax.set_title(f'{title}\nWhite=Attend (0), Blue=Masked (-inf)', fontsize=14, fontweight='bold')
+    ax.set_xlabel('Key Position')
+    ax.set_ylabel('Query Position')
+    
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+    cbar.set_label('Attention Weight', rotation=270, labelpad=20)
+    cbar.set_ticks([-1, 1])
+    cbar.set_ticklabels(['-inf (Masked)', '0 (Attend)'])
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    if save_path is None:
+        save_path = 'attention_mask.png'
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Attention mask saved to: {save_path}")
+    
+    plt.close()  # Close to free memory
+    return save_path
+
+
+def visualize_loss_sequence(sequence_length, ce_loss_indexes, mse_loss_indexes, 
+                          text_len, vit_len, vae_len, title="Loss Index Sequence", save_path=None):
+    """
+    Create a sequence diagram showing which tokens have which type of loss
+    """
+    text_len -=2
+    vae_len +=2
+    fig, ax = plt.subplots(figsize=(16, 4))
+    
+    # Create base sequence
+    sequence = list(range(sequence_length))
+    colors = ['lightgray'] * sequence_length
+    labels = ['No Loss'] * sequence_length
+    
+    # Mark CE loss positions (blue)
+    if ce_loss_indexes is not None:
+        for idx in ce_loss_indexes:
+            if idx < sequence_length:
+                colors[idx] = 'blue'
+                labels[idx] = 'CE Loss'
+    
+    # Mark MSE loss positions (red) - may override CE
+    if mse_loss_indexes is not None:
+        for idx in mse_loss_indexes:
+            if idx < sequence_length:
+                colors[idx] = 'red'
+                labels[idx] = 'MSE Loss'
+    
+    # Create bar chart
+    bars = ax.bar(sequence, [1]*sequence_length, color=colors, alpha=0.7, edgecolor='black', linewidth=0.5)
+    
+    # Add section dividers and labels
+    text_end = text_len
+    vit_end = text_len + vit_len
+    vae_end = text_len + vit_len + vae_len
+    
+    # Vertical dividers
+    ax.axvline(x=text_end - 0.5, color='yellow', linewidth=3, alpha=0.8)
+    ax.axvline(x=vit_end - 0.5, color='yellow', linewidth=3, alpha=0.8)
+    
+    # Section background colors (subtle)
+    ax.axvspan(-0.5, text_end - 0.5, alpha=0.1, color='green', label='Text Section')
+    ax.axvspan(text_end - 0.5, vit_end - 0.5, alpha=0.1, color='orange', label='ViT Section')  
+    ax.axvspan(vit_end - 0.5, vae_end - 0.5, alpha=0.1, color='purple', label='VAE Section')
+    
+    # Section labels at top
+    ax.text(text_len//2, 1.1, 'TEXT TOKENS', ha='center', fontweight='bold', fontsize=12)
+    ax.text(text_len + vit_len//2, 1.1, 'VIT TOKENS', ha='center', fontweight='bold', fontsize=12)
+    ax.text(text_len + vit_len + vae_len//2, 1.1, 'VAE TOKENS', ha='center', fontweight='bold', fontsize=12)
+    
+    # Add position numbers for key locations
+    key_positions = [0, text_end-1, text_end, vit_end-1, vit_end, vae_end-1]
+    for pos in key_positions:
+        if pos < sequence_length:
+            ax.text(pos, -0.15, str(pos), ha='center', fontweight='bold', fontsize=10)
+    
+    # Add tick marks for every 10th position if sequence is long
+    if sequence_length > 20:
+        tick_positions = list(range(0, sequence_length, max(1, sequence_length//20)))
+        ax.set_xticks(tick_positions)
+        ax.set_xticklabels([str(i) for i in tick_positions], fontsize=8)
+    else:
+        ax.set_xticks(sequence)
+        ax.set_xticklabels([str(i) for i in sequence], fontsize=8)
+    
+    ax.set_ylim(-0.2, 1.3)
+    ax.set_xlim(-0.5, sequence_length - 0.5)
+    ax.set_ylabel('Loss Type')
+    ax.set_xlabel('Sequence Position')
+    ax.set_title(f'{title}\nBlue=CE Loss, Red=MSE Loss, Gray=No Loss', fontsize=14, fontweight='bold')
+    
+    # Custom legend
+    legend_elements = [
+        patches.Patch(color='blue', alpha=0.7, label='CE Loss (Text)'),
+        patches.Patch(color='red', alpha=0.7, label='MSE Loss (VAE)'),
+        patches.Patch(color='lightgray', alpha=0.7, label='No Loss'),
+        patches.Patch(color='green', alpha=0.1, label='Text Section'),
+        patches.Patch(color='orange', alpha=0.1, label='ViT Section'),
+        patches.Patch(color='purple', alpha=0.1, label='VAE Section')
+    ]
+    ax.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(1.0, 1.0))
+    
+    # Add grid
+    ax.grid(True, alpha=0.3, axis='x')
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    if save_path is None:
+        save_path = 'loss_sequence.png'
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Loss sequence plot saved to: {save_path}")
+    
+    plt.close()  # Close to free memory
+    return save_path
+
+
+def analyze_bagel_batch(batch, tokenizer=None, detailed=True, save_dir="./plots"):
+    """
+    Comprehensive analysis of a BAGEL batch with detailed statistics and visualizations
+    """
+    
+    # Create save directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    
+    print("=" * 80)
+    print("BAGEL BATCH ANALYSIS")
+    print("=" * 80)
+    
+    # ... existing analysis code ...
+    # [Keep all the existing analysis code from lines 1-400+]
+    
+    # Get key tensor information for visualizations
+    text_indexes = batch.get('packed_text_indexes')
+    vit_indexes = batch.get('packed_vit_token_indexes')
+    vae_indexes = batch.get('packed_vae_token_indexes')
+    
+    text_len = len(text_indexes) if text_indexes is not None else 0
+    vit_len = len(vit_indexes) if vit_indexes is not None else 0
+    vae_len = len(vae_indexes) if vae_indexes is not None else 0
+    
+    sequence_length = batch.get('sequence_length', text_len + vit_len + vae_len)
+    
+    # Loss indexes
+    ce_loss_indexes = batch.get('ce_loss_indexes')
+    mse_loss_indexes = batch.get('mse_loss_indexes')
+    
+    # [Keep all existing analysis code here]
+    # ... (lines 1-500+ of existing analysis) ...
+    
+    # NEW: VISUALIZATION SECTION
+    print("\n" + "=" * 80)
+    print("GENERATING VISUALIZATIONS")
+    print("=" * 80)
+    
+    saved_plots = []
+    
+    # 1. Attention Mask Visualization
+    attn_masks = batch.get('nested_attention_masks')
+    if attn_masks and len(attn_masks) > 0:
+        print("Creating attention mask visualization...")
+        
+        mask = attn_masks[0]  # Take first mask
+        attention_save_path = os.path.join(save_dir, 'attention_mask.png')
+        saved_path = visualize_attention_mask(mask, text_len, vit_len, vae_len, 
+                                             title="Attention Mask Structure",
+                                             save_path=attention_save_path)
+        saved_plots.append(saved_path)
+        
+        print(f"Attention mask shape: {mask.shape}")
+        print(f"Sections - Text: 0-{text_len-1}, ViT: {text_len}-{text_len+vit_len-1}, VAE: {text_len+vit_len}-{text_len+vit_len+vae_len-1}")
+    
+    # 2. Loss Index Sequence Visualization
+    print("Creating loss sequence visualization...")
+    
+    loss_save_path = os.path.join(save_dir, 'loss_sequence.png')
+    saved_path = visualize_loss_sequence(sequence_length, ce_loss_indexes, mse_loss_indexes,
+                                       text_len, vit_len, vae_len,
+                                       title="Loss Computation Sequence",
+                                       save_path=loss_save_path)
+    saved_plots.append(saved_path)
+    
+    # Print loss statistics
+    if ce_loss_indexes is not None:
+        print(f"CE Loss positions: {ce_loss_indexes.tolist()}")
+    if mse_loss_indexes is not None:
+        print(f"MSE Loss positions: {mse_loss_indexes.tolist()}")
+    
+    print(f"Visualizations saved to: {saved_plots}")
+    print("Visualizations complete!")
     
     print("=" * 80)
     print("BAGEL BATCH ANALYSIS")
@@ -541,91 +819,7 @@ def analyze_bagel_batch(batch, tokenizer=None, detailed=True):
             print(f"   Average timestep: {valid_timesteps.float().mean().item():.1f}")
         else:
             print("   No valid timesteps found")
-    
-    # 9. SEQUENCE CONSISTENCY CHECKS
-    print("\n9. CONSISTENCY CHECKS:")
-    
-    total_seq_len = batch.get('sequence_length', len(batch.get('packed_text_ids', [])))
-    text_len = len(batch.get('packed_text_ids', []))
-    
-    print(f"   Declared sequence length: {total_seq_len}")
-    print(f"   Actual text IDs length: {text_len}")
-    print(f"   Length consistency: {'PASS' if total_seq_len == text_len else 'FAIL'}")
-    
-    # Check index ranges
-    all_indexes = []
-    if text_indexes is not None:
-        all_indexes.extend(text_indexes.tolist())
-    if vit_indexes is not None:
-        all_indexes.extend(vit_indexes.tolist())
-    if vae_indexes is not None:
-        all_indexes.extend(vae_indexes.tolist())
-    
-    if all_indexes:
-        all_indexes = sorted(set(all_indexes))
-        expected_range = list(range(max(all_indexes) + 1))
-        missing_indexes = set(expected_range) - set(all_indexes)
-        
-        print(f"   Index coverage: {len(all_indexes)} unique positions")
-        print(f"   Index range: 0 - {max(all_indexes)}")
-        print(f"   Missing indexes: {len(missing_indexes)} ({'PASS' if len(missing_indexes) == 0 else 'FAIL'})")
-        if missing_indexes and len(missing_indexes) < 20:
-            print(f"   Missing: {sorted(missing_indexes)}")
-    
-    # 10. MEMORY USAGE
-    print("\n10. MEMORY USAGE:")
-    
-    total_elements = 0
-    total_bytes = 0
-    tensor_stats = []
-    
-    for key, value in batch.items():
-        if isinstance(value, torch.Tensor):
-            elements = value.numel()
-            bytes_used = elements * value.element_size()
-            total_elements += elements
-            total_bytes += bytes_used
-            tensor_stats.append((key, elements, bytes_used))
-    
-    # Sort by memory usage
-    tensor_stats.sort(key=lambda x: x[2], reverse=True)
-    
-    for key, elements, bytes_used in tensor_stats:
-        print(f"   {key:25}: {elements:8,} elements, {bytes_used/1024/1024:6.2f} MB")
-    
-    print(f"   {'TOTAL':25}: {total_elements:8,} elements, {total_bytes/1024/1024:6.2f} MB")
-    
-    # 15. GENERATE SUMMARY REPORT
-    print("\n15. BATCH SUMMARY:")
-    
-    total_text_tokens = len(text_indexes) if text_indexes is not None else 0
-    total_vit_tokens = len(vit_indexes) if vit_indexes is not None else 0
-    total_vae_tokens = len(vae_indexes) if vae_indexes is not None else 0
-    
-    print(f"   Text tokens: {total_text_tokens}")
-    print(f"   ViT tokens: {total_vit_tokens}")
-    print(f"   VAE tokens: {total_vae_tokens}")
-    print(f"   Total tokens: {total_text_tokens + total_vit_tokens + total_vae_tokens}")
-    
-    if total_text_tokens + total_vit_tokens + total_vae_tokens > 0:
-        text_pct = total_text_tokens / (total_text_tokens + total_vit_tokens + total_vae_tokens) * 100
-        vit_pct = total_vit_tokens / (total_text_tokens + total_vit_tokens + total_vae_tokens) * 100  
-        vae_pct = total_vae_tokens / (total_text_tokens + total_vit_tokens + total_vae_tokens) * 100
-        
-        print(f"   Token distribution: {text_pct:.1f}% text, {vit_pct:.1f}% ViT, {vae_pct:.1f}% VAE")
-    
-    print("\n" + "=" * 80)
-    print("ANALYSIS COMPLETE")
-    print("=" * 80)
-    
-    return {
-        'total_tokens': total_text_tokens + total_vit_tokens + total_vae_tokens,
-        'text_tokens': total_text_tokens,
-        'vit_tokens': total_vit_tokens, 
-        'vae_tokens': total_vae_tokens,
-        'memory_mb': total_bytes / 1024 / 1024,
-        'batch_keys': list(batch.keys()),
-    }
+    return None
 
 
 def test_dataloader_statistics(dataloader, tokenizer=None, num_batches=3):
@@ -686,4 +880,13 @@ def test_dataloader_statistics(dataloader, tokenizer=None, num_batches=3):
 # USAGE EXAMPLE:
 if __name__ == "__main__":
 
-    
+    tokenizer = Qwen2Tokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+    tokenizer, new_token_ids, num_new_tokens = add_special_tokens(tokenizer)
+    # Uncomment below to enable VAE encoding:
+    vae_model, vae_config = load_ae("/home/haoming/Bagel/models/BAGEL-7B-MoT/ae.safetensors")
+    vae_model.eval()
+
+    train_loader = get_loader(split = "val")
+    print("Testing single batch:")
+    batch = next(iter(train_loader))
+    analyze_bagel_batch(batch, tokenizer, save_dir="./bagel_analysis_plots")

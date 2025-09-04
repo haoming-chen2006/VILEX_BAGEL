@@ -75,12 +75,13 @@ class SiglipVisionConfig(_SiglipVisionConfig):
         num_hidden_layers=12,
         num_attention_heads=12,
         num_channels=3,
-        image_size=224,
+        image_size=512,
         patch_size=16,
         hidden_act="gelu_pytorch_tanh",
         layer_norm_eps=1e-6,
         attention_dropout=0.0,
         rope=True,
+        output_hidden_states=True,
         **kwargs,
     ):
         super().__init__(
@@ -97,6 +98,7 @@ class SiglipVisionConfig(_SiglipVisionConfig):
             **kwargs)
         
         self.rope = rope
+        self.output_hidden_states = True
 
 
 class RotaryEmbedding2D(torch.nn.Module):
@@ -149,6 +151,7 @@ class SiglipVisionEmbeddings(nn.Module):
         self.embed_dim = config.hidden_size
         self.image_size = config.image_size
         self.patch_size = config.patch_size
+
 
         self.patch_embedding = nn.Conv2d(
             in_channels=config.num_channels,
@@ -317,13 +320,27 @@ class SiglipEncoder(nn.Module):
         sin_h: torch.Tensor = None,
         cos_w: torch.Tensor = None,
         sin_w: torch.Tensor = None,
+        output_hidden_states: bool = None, 
     ) -> torch.Tensor:
 
+        # Use config default if not specified
+        if output_hidden_states is None:
+            output_hidden_states = self.config.output_hidden_states
+        
         hidden_states = inputs_embeds
+        all_hidden_states = () if output_hidden_states else None 
+        
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,) 
+        
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(hidden_states, cu_seqlens, max_seqlen,
                                           cos_h=cos_h, sin_h=sin_h, cos_w=cos_w, sin_w=sin_w)
-
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)  
+        
+        if output_hidden_states:
+            return all_hidden_states  
         return hidden_states
 
 
@@ -348,12 +365,17 @@ class SiglipVisionTransformer(nn.Module):
         packed_flattened_position_ids: torch.LongTensor,
         cu_seqlens: torch.IntTensor,
         max_seqlen: int,
+        output_hidden_states: bool = None,  # ← Add this parameter
     ) -> torch.Tensor:
+        
+        # Use config default if not specified
+        if output_hidden_states is None:
+            output_hidden_states = self.config.output_hidden_states
+        
         hidden_states = self.embeddings(
             packed_pixel_values=packed_pixel_values, 
             packed_flattened_position_ids=packed_flattened_position_ids
         )
-
         extra_inputs = {}
         if self.config.rope:
             extra_inputs.update(
@@ -363,12 +385,29 @@ class SiglipVisionTransformer(nn.Module):
                 sin_w = self.rope.sin_w[packed_flattened_position_ids]
             )
 
-        last_hidden_state = self.encoder(
-            inputs_embeds=hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, 
+        encoder_outputs = self.encoder(
+            inputs_embeds=hidden_states, 
+            cu_seqlens=cu_seqlens, 
+            max_seqlen=max_seqlen,
+            output_hidden_states=output_hidden_states,  # ← Pass the parameter
             **extra_inputs
         )
-        last_hidden_state = self.post_layernorm(last_hidden_state)
-        return last_hidden_state
+        
+        if output_hidden_states:
+            all_hidden_states = encoder_outputs
+            
+            # Apply post_layernorm only to the final layer? or apply it to all layers?
+            all_hidden_states_normalized = tuple(
+                self.post_layernorm(hidden_state) if i == len(all_hidden_states) - 1 
+                else hidden_state 
+                for i, hidden_state in enumerate(all_hidden_states)
+            )
+            
+            return all_hidden_states_normalized
+        else:
+            last_hidden_state = encoder_outputs
+            last_hidden_state = self.post_layernorm(last_hidden_state)
+            return last_hidden_state
 
 
 class SiglipVisionModel(SiglipPreTrainedModel):
@@ -392,11 +431,17 @@ class SiglipVisionModel(SiglipPreTrainedModel):
         packed_flattened_position_ids: torch.LongTensor,
         cu_seqlens: torch.IntTensor,
         max_seqlen: int,
+        output_hidden_states: bool = None,  # ← Add this parameter
     ) -> torch.Tensor:
+        
+        # Use config default if not specified  
+        if output_hidden_states is None:
+            output_hidden_states = self.config.output_hidden_states
 
         return self.vision_model(
             packed_pixel_values=packed_pixel_values,
             packed_flattened_position_ids=packed_flattened_position_ids,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            output_hidden_states=output_hidden_states,  # ← Pass the parameter
         )

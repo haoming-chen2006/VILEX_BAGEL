@@ -1,0 +1,9 @@
+setup.py
+vilex/__init__.py
+vilex/projectors.py
+vilex/vilex.py
+vilex.egg-info/PKG-INFO
+vilex.egg-info/SOURCES.txt
+vilex.egg-info/dependency_links.txt
+vilex.egg-info/requires.txt
+vilex.egg-info/top_level.txt

@@ -22,6 +22,19 @@ from .modeling_utils import MLPconnector, TimestepEmbedder, PositionEmbedding
 from modeling.cache_utils.taylorseer import cache_init
 
 from tqdm import tqdm
+from vilex import projectors
+
+
+class ProjectorInitializer:
+    """Handles initialization of projection layers."""
+
+    @staticmethod
+    def initialize_with_zeros(linear_layer: nn.Linear) -> None:
+        """Initialize linear layer weights and biases with zeros."""
+        with torch.no_grad():
+            nn.init.zeros_(linear_layer.weight)
+            if linear_layer.bias is not None:
+                nn.init.zeros_(linear_layer.bias)
 
 
 class BagelConfig(PretrainedConfig):
@@ -30,21 +43,23 @@ class BagelConfig(PretrainedConfig):
         visual_gen=True,
         visual_und=True,
         llm_config=None,
-        vit_config=None, #vilex replace
+        vit_config=None,
         vae_config=None,
         latent_patch_size=2,
         max_latent_size=32,
-        vit_max_num_patch_per_side=70, #vilex config replace
+        vit_max_num_patch_per_side=70,
         connector_act="gelu_pytorch_tanh",
         interpolate_pos=False,
         timestep_shift=1.0,
+        use_vilex = True,
+        vilex_config: Optional[Dict] = None,
         **kwargs
     ):
         super().__init__(**kwargs)
         self.visual_gen = visual_gen
         self.visual_und = visual_und
         self.llm_config = llm_config
-        self.vit_config = vit_config #vadd vilex config
+        self.vit_config = vit_config
         self.vae_config = vae_config
         self.latent_patch_size = latent_patch_size
         self.max_latent_size = max_latent_size
@@ -52,6 +67,8 @@ class BagelConfig(PretrainedConfig):
         self.connector_act = connector_act
         self.interpolate_pos = interpolate_pos
         self.timestep_shift = timestep_shift
+        self.vilex_config = vilex_config
+        self.use_vilex = use_vilex
 
 
 class Bagel(PreTrainedModel):
@@ -78,12 +95,24 @@ class Bagel(PreTrainedModel):
             self.latent_pos_embed = PositionEmbedding(self.max_latent_size, self.hidden_size)
 
         if config.visual_und:
-            self.vit_model = vit_model 
+            self.vit_model = vit_model
             self.vit_patch_size = config.vit_config.patch_size
             self.vit_max_num_patch_per_side = config.vit_max_num_patch_per_side
             self.vit_hidden_size = config.vit_config.hidden_size
-            self.connector = MLPconnector(self.vit_hidden_size, self.hidden_size, config.connector_act) #change to vilex connector
-            self.vit_pos_embed = PositionEmbedding(self.vit_max_num_patch_per_side, self.hidden_size) #change or no?
+            self.use_vilex = config.use_vilex
+            if self.use_vilex:
+                self.connector = projectors.MultiLayerAttentionPoolingProjector(
+                                    in_dim = self.vit_hidden_size,
+                                    out_dim = self.hidden_size,
+                                    num_layers= config.vilex_config["num_layer"],
+                                    num_heads= config.vilex_config["num_heads"],
+                                    num_output_tokens= config.vilex_config["num_output_tokens"],
+                                    taildrop_prob = config.vilex_config["taildrop_prob"],
+                                    taildrop_max = config.vilex_config["taildrop_max"],
+                                    )
+            else:
+                self.connector = MLPconnector(self.vit_hidden_size, self.hidden_size, config.connector_act)
+            self.vit_pos_embed = PositionEmbedding(self.vit_max_num_patch_per_side, self.hidden_size)
 
         if config.interpolate_pos:
             self.get_flattened_position_ids = get_flattened_position_ids_interpolate
@@ -122,6 +151,7 @@ class Bagel(PreTrainedModel):
         packed_vae_token_indexes: Optional[torch.LongTensor] = None,
         packed_timesteps: Optional[torch.LongTensor] = None,
         mse_loss_indexes: Optional[torch.BoolTensor] = None,
+        num_tokens: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -155,11 +185,15 @@ class Bagel(PreTrainedModel):
 
         if nested_attention_masks is None:
             sparse_mask = create_sparse_mask(sample_lens, split_lens, attn_modes, packed_text_embedding.device)
+            
             seqlen = sum(sample_lens)
+
             block_mask = create_block_mask(
                 sparse_mask, B=1, H=self.num_heads, Q_LEN=seqlen, KV_LEN=seqlen, 
                 device=packed_text_embedding.device, BLOCK_SIZE=128, _compile=True
             )
+
+
             attention_mask = block_mask
         else:
             attention_mask = nested_attention_masks
@@ -168,13 +202,14 @@ class Bagel(PreTrainedModel):
             cu_seqlens = torch.nn.functional.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0))
             cu_seqlens = cu_seqlens.to(torch.int32)
             max_seqlen = torch.max(vit_token_seqlens).item()
+            print(packed_vit_tokens.shape)
             packed_vit_token_embed = self.vit_model(
                 packed_pixel_values=packed_vit_tokens, 
                 packed_flattened_position_ids=packed_vit_position_ids,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
             )
-            packed_vit_token_embed = self.connector(packed_vit_token_embed) #basically change self .connector into this new thing
+            packed_vit_token_embed = self.connector(packed_vit_token_embed)
             vit_token_pos_emb = self.vit_pos_embed(packed_vit_position_ids)
             packed_vit_token_embed = packed_vit_token_embed + vit_token_pos_emb
             packed_sequence[packed_vit_token_indexes] = packed_vit_token_embed
@@ -388,7 +423,7 @@ class Bagel(PreTrainedModel):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
         )
-        packed_vit_token_embed = self.connector(packed_vit_token_embed) #replace with vit connector
+        packed_vit_token_embed = self.connector(packed_vit_token_embed)
         pos_emb = self.vit_pos_embed(packed_vit_position_ids)
         packed_vit_token_embed = packed_vit_token_embed + pos_emb
         if packed_vit_token_embed.dtype != packed_sequence.dtype:
@@ -505,6 +540,7 @@ class Bagel(PreTrainedModel):
         packed_indexes: torch.LongTensor,
         key_values_lens: torch.IntTensor,
         packed_key_value_indexes: torch.Tensor,
+        num_tokens: int,
     ):
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))

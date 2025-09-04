@@ -74,6 +74,7 @@ attention mask at vae: tensor([0., 0., 0.,  ..., 0., 0., 0.])
    Average weight: 1.0000
    Label IDs shape: torch.Size([27])
    Label range: 6 - 151645
+   
    MSE loss indexes shape: torch.Size([1024])
    MSE loss range: 1053 - 2076
    Number of VAE tokens with loss: 1024

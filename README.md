@@ -1,6 +1,7 @@
 ## VILEX_Structure
 
-![Vilex Poster][/vilex_poster.jpg)
+
+![Vilex Poster](vilex_poster.jpg)
 
 A quick visual summary of the Vilex integration and BAGEL packing.
 
@@ -29,13 +30,11 @@ Use `analyze_bagel_batch(batch, ...)` to generate diagnostic visualizations. Exa
 
 - Attention mask visualization:
   - /home/haoming/Bagel/data/bagel_analysis_plots/attention_mask.png  
-  - Preview:
-  ![/home/haoming/Bagel/data/bagel_analysis_plots/attention_mask.png](/home/haoming/Bagel/data/bagel_analysis_plots/attention_mask.png)
+  ![Attention Mask](attention.png)
 
 - Loss sequence visualization:
   - /home/haoming/Bagel/data/bagel_analysis_plots/loss_sequence.png  
-  - Preview:
-  ![/home/haoming/Bagel/data/bagel_analysis_plots/loss_sequence.png](/home/haoming/Bagel/data/bagel_analysis_plots/loss_sequence.png)
+  ![Loss Sequence](loss.png)
 
 ---
 

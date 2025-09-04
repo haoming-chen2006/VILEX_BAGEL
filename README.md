@@ -1,3 +1,64 @@
+## VILEX_Structure
+
+![Vilex Poster](/home/haoming/Bagel/vilex_poster.png)
+
+A quick visual summary of the Vilex integration and BAGEL packing.
+
+
+---
+
+## Vilex integration (data/vilex_dataset.py)
+
+- Streaming via WebDataset: shards are tar files containing paired `*.jpg` and `*.txt`. Uses `wds.to_tuple("jpg","txt")`.
+- Main class: `VilexDataset(torch.utils.data.IterableDataset)`
+  - Key args: `shards`, `tokenizer`, `special_tokens`, `vae_model` (optional), `max_image_size`, `vae_image_downsample`, `vit_patch_size`, `max_sequence_length`, `shuffle_buffer_size`.
+  - Resizes images so the final size is divisible by LCM(vit_patch_size, vae_image_downsample).
+  - Transform pipeline: Resize -> CenterCrop -> ToTensor -> Normalize(mean=0.5, std=0.5).
+  - Pipeline: shardlist → shuffle/split_by_worker → tarfile_to_samples → decode → to_tuple → map(_process_sample).
+- Packing:
+  - Order: TEXT (BOS + tokens + EOS) → ViT block (query tokens + EOS marker) → VAE block (start_of_image, latents, end_of_image).
+  - Outputs BAGEL-style fields: `packed_text_ids`, `packed_position_ids`, `packed_vit_tokens`, `packed_vit_position_ids`, `packed_vae_token_indexes`, `packed_timesteps`, `mse_loss_indexes`, `packed_label_ids`, `ce_loss_indexes`, `ce_loss_weights`, `padded_images`, `patchified_vae_latent_shapes`, `nested_attention_masks`, etc.
+  - RoPE/position helpers: `get_flattened_position_ids_interpolate` / `get_flattened_position_ids_extrapolate`.
+  - Attention masks via `prepare_attention_mask_per_sample`.
+
+---
+
+## Masking and loss indices
+
+Use `analyze_bagel_batch(batch, ...)` to generate diagnostic visualizations. Example outputs are stored in:
+
+- Attention mask visualization:
+  - /home/haoming/Bagel/data/bagel_analysis_plots/attention_mask.png  
+  - Preview:
+  ![/home/haoming/Bagel/data/bagel_analysis_plots/attention_mask.png](/home/haoming/Bagel/data/bagel_analysis_plots/attention_mask.png)
+
+- Loss sequence visualization:
+  - /home/haoming/Bagel/data/bagel_analysis_plots/loss_sequence.png  
+  - Preview:
+  ![/home/haoming/Bagel/data/bagel_analysis_plots/loss_sequence.png](/home/haoming/Bagel/data/bagel_analysis_plots/loss_sequence.png)
+
+---
+
+
+## Tests and quick checks
+
+Run tests (repo root):
+- Run all tests:
+  - pytest -q
+- Run a single test file:
+  - pytest -q tests/test_xxx.py
+- Filter with -k for a name match.
+
+Quick dataloader check:
+  - python data/vilex_dataset.py
+- Other test:
+  - test_whole -- load ema pretrained weights, need 4 GPU
+  - test_forward -- hf pipelien that can work on single GPU, no pretrained weights from BAGEL
+  - scripts/vilex.sh to run vilex model, tune.sh to run original model pretraining
+
+---
+
+Below is original readme
 <p align="center">
   <img src="https://lf3-static.bytednsdoc.com/obj/eden-cn/nuhojubrps/banner.png" alt="BAGEL" width="480"/>
 </p>

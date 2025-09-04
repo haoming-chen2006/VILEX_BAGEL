@@ -1,5 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates.
-# SPDX-License-Identifier: Apache-2.0
+
 
 import functools
 import os
@@ -24,7 +23,7 @@ from transformers.optimization import (
     get_cosine_with_min_lr_schedule_with_warmup,
 )
 
-from data.dataset_base import DataConfig, PackedDataset, collate_wrapper
+from data.vilex_dataset import get_loader
 from data.data_utils import add_special_tokens
 from modeling.autoencoder import load_ae
 from modeling.bagel import (
@@ -104,11 +103,11 @@ class ModelArguments:
         metadata={"help": "Spatial size (in VAE pixels) covered by each latent patch."}
     )
     vit_patch_size: int = field(
-        default=14,
+        default=16,
         metadata={"help": "Patch size (pixels) for the Vision Transformer encoder."}
     )
     vit_max_num_patch_per_side: int = field(
-        default=70,
+        default=32,
         metadata={"help": "Maximum number of ViT patches along one image side after cropping / resize."}
     )
     connector_act: str = field(
@@ -433,6 +432,7 @@ def main():
     # prepare auto resume logic:
     if training_args.auto_resume:
         resume_from = get_latest_ckpt(training_args.checkpoint_dir)
+        print("resuming from" + str(resume_from))
         if resume_from is None:
             resume_from = training_args.resume_from
             resume_model_only = training_args.resume_model_only
@@ -457,6 +457,7 @@ def main():
 
     # Setup model:
     if training_args.finetune_from_hf:
+        print("loading from hf")
         llm_config = Qwen2Config.from_json_file(os.path.join(model_args.model_path, "llm_config.json"))
     else:
         llm_config = Qwen2Config.from_pretrained(model_args.llm_path)
@@ -524,8 +525,7 @@ def main():
 
     show_memory("AFTER BAGEL MODEL CREATION", logger)
 
-    if training_args.visual_und:
-        model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config)
+    model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config)
 
     # Setup tokenizer for model:
     tokenizer = Qwen2Tokenizer.from_pretrained(model_args.model_path if training_args.finetune_from_hf else model_args.llm_path)
@@ -557,16 +557,14 @@ def main():
         num_shard=training_args.num_shard,
     )
     ema_model = deepcopy(model)
-
-    print("start loading checkpoint")
     
+
     model, ema_model = FSDPCheckpoint.try_load_ckpt(
         resume_from, logger, model, ema_model, resume_from_ema=finetune_from_ema
     )
     show_memory("AFTER CHECKPOINT LOAD", logger)
     
     ema_model = fsdp_ema_setup(ema_model, fsdp_config)
-    show_memory("AFTER EMA FSDP SETUP", logger)
     
     fsdp_model = fsdp_wrapper(model, fsdp_config)
     show_memory("AFTER FSDP WRAPPER", logger)
@@ -579,10 +577,6 @@ def main():
     )
 
 
-    if dist.get_rank() == 0:
-        print(fsdp_model)
-        for name, param in model.named_parameters():
-            print(name, param.requires_grad)
 
     # Setup optimizer and scheduler
     optimizer = torch.optim.AdamW(
@@ -592,7 +586,7 @@ def main():
         eps=training_args.eps, 
         weight_decay=0
     )
-    show_memory("AFTER OPTIMIZER CREATION", logger)
+
     if training_args.lr_scheduler == 'cosine':
         scheduler = get_cosine_with_min_lr_schedule_with_warmup(
             optimizer=optimizer,
@@ -616,47 +610,9 @@ def main():
             resume_from, optimizer, scheduler, fsdp_config, 
         )
 
-    
-    if training_args.visual_und:
-        dataset_config.vit_patch_size = model_args.vit_patch_size
-        dataset_config.max_num_patch_per_side = model_args.vit_max_num_patch_per_side
-    if training_args.visual_gen:
-        vae_image_downsample = model_args.latent_patch_size * vae_config.downsample
-        dataset_config.vae_image_downsample = vae_image_downsample
-        dataset_config.max_latent_size = model_args.max_latent_size
-        dataset_config.text_cond_dropout_prob = model_args.text_cond_dropout_prob
-        dataset_config.vae_cond_dropout_prob = model_args.vae_cond_dropout_prob
-        dataset_config.vit_cond_dropout_prob = model_args.vit_cond_dropout_prob
-    train_dataset = PackedDataset(
-        dataset_config,
-        tokenizer=tokenizer,
-        special_tokens=new_token_ids,
-        local_rank=dist.get_rank(),
-        world_size=dist.get_world_size(),
-        num_workers=data_args.num_workers,
-        expected_num_tokens=training_args.expected_num_tokens,
-        max_num_tokens_per_sample=data_args.max_num_tokens_per_sample,
-        max_num_tokens=data_args.max_num_tokens,
-        max_buffer_size=data_args.max_buffer_size,
-        prefer_buffer_before=data_args.prefer_buffer_before,
-        interpolate_pos=model_args.interpolate_pos,
-        use_flex=training_args.use_flex,
-        data_status=data_status,
-    )
-    train_dataset.set_epoch(data_args.data_seed)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=1, # batch size is 1 packed dataset
-        num_workers=data_args.num_workers,
-        pin_memory=True,
-        collate_fn=collate_wrapper(),
-        drop_last=True,
-        prefetch_factor=data_args.prefetch_factor,
-    )
-
+    train_loader = get_loader(split = "train")
     # Prepare models for training:
-    if training_args.visual_gen:
-        vae_model.to(device).eval()
+    vae_model.to(device).eval()
     fsdp_model.train()
     ema_model.eval()
 
@@ -667,27 +623,43 @@ def main():
     logger.info(f"Training for {training_args.total_steps} steps, starting at {train_step}...")
     for curr_step, data in enumerate(train_loader, start=train_step):
         # Memory tracking for first few steps
-        if curr_step <= 3:
+        if curr_step <= 1:
             show_memory(f"STEP {curr_step} - START", logger)
         
-        data = data.cuda(device).to_dict()
         data_indexes = data.pop('batch_data_indexes', None)
         ce_loss_weights = data.pop('ce_loss_weights', None)
         
         if curr_step <= 3:
             show_memory(f"STEP {curr_step} - AFTER DATA LOAD", logger)
-        
+
+        # converting data now -- need a more permanenet solution to match    
+        for k, v in data.items():
+            if isinstance(v, torch.Tensor):
+                # Move to device first
+                v = v.to(device)
+                if v.dtype.is_floating_point:
+                    print("converting!" + str(k))
+                    v = v.to(torch.bfloat16)
+                
+                data[k] = v
+
+        print("finished converting!")
+
         with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
             if training_args.visual_gen:
                 with torch.no_grad():
                     data['padded_latent'] = vae_model.encode(data.pop('padded_images'))
             loss_dict = fsdp_model(**data)
 
-        if curr_step <= 3:
-            show_memory(f"STEP {curr_step} - AFTER FORWARD", logger)
-
         loss = 0
         ce = loss_dict["ce"]
+
+
+
+        # usually train with ce
+
+
+
         if ce is not None:
             total_ce_tokens = torch.tensor(len(data['ce_loss_indexes']), device=device)
             dist.all_reduce(total_ce_tokens, op=dist.ReduceOp.SUM)
@@ -705,17 +677,15 @@ def main():
             loss_dict["ce"] = torch.tensor(0, device=device)
             total_ce_tokens = torch.tensor(0, device=device)
 
-        if training_args.visual_gen:
-            mse = loss_dict["mse"]
-            total_mse_tokens = torch.tensor(len(data['mse_loss_indexes']), device=device)
-            dist.all_reduce(total_mse_tokens, op=dist.ReduceOp.SUM)
-            mse = mse.mean(dim=-1).sum() * dist.get_world_size() / total_mse_tokens
-            loss_dict["mse"] = mse.detach()
-            loss = loss + mse * training_args.mse_weight
-        else:
-            assert not training_args.visual_gen
-            loss_dict["mse"] = torch.tensor(0, device=device)
-            total_mse_tokens = torch.tensor(0, device=device)
+
+        # setup mse loss -- must be true as we are training for generation always
+        
+        mse = loss_dict["mse"]
+        total_mse_tokens = torch.tensor(len(data['mse_loss_indexes']), device=device)
+        dist.all_reduce(total_mse_tokens, op=dist.ReduceOp.SUM)
+        mse = mse.mean(dim=-1).sum() * dist.get_world_size() / total_mse_tokens
+        loss_dict["mse"] = mse.detach()
+        loss = loss + mse * training_args.mse_weight
 
         optimizer.zero_grad()
         loss.backward()
@@ -724,7 +694,7 @@ def main():
         scheduler.step()
         fsdp_ema_update(ema_model, fsdp_model, decay=training_args.ema)
 
-        if curr_step <= 3:
+        if curr_step <= 1:
             show_memory(f"STEP {curr_step} - AFTER BACKWARD+UPDATE", logger)
 
         # Log loss values:

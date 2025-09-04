@@ -1,0 +1,32 @@
+
+torchrun \
+  --nnodes=1 \
+  --node_rank=0 \
+  --nproc_per_node=4 \
+  --master_addr=127.0.0.1 \
+  --master_port=29502 \
+  train/pretrain_unified_navit.py \
+  --dataset_config_file ./data/configs/example.yaml \
+  --model_path  /home/haoming/Bagel/models/BAGEL-7B-MoT\
+  --layer_module Qwen2MoTDecoderLayer \
+  --max_latent_size 64 \
+  --finetune_from_hf True \
+  --auto_resume True \
+  --resume-model-only False \
+  --finetune-from-ema True \
+   --finetune-from-hf True \
+  --log_every 1 \
+  --lr 2e-5 \
+  --num_worker 2 \
+  --expected_num_tokens 2048 \
+  --max_num_tokens 3000 \
+  --max_num_tokens_per_sample 2048\
+  --num_shard 4\
+   --sharding_strategy FULL_SHARD\
+  --ema 0.0  \
+  --freeze_llm True \
+  --freeze_vit False \
+  --freeze_vae True \
+  --cpu_offload True \
+  --save_every 10\
+  --checkpoint_dir /home/haoming/Bagel/results/checkpoints\

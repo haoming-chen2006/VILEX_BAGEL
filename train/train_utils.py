@@ -26,6 +26,7 @@ def create_logger(logging_dir, rank, filename="log"):
     return logger
 
 
+
 def get_latest_ckpt(checkpoint_dir):
     step_dirs = [d for d in os.listdir(checkpoint_dir) if os.path.isdir(os.path.join(checkpoint_dir, d))]
     if len(step_dirs) == 0:

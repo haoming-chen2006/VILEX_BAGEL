@@ -557,8 +557,6 @@ def main():
         num_shard=training_args.num_shard,
     )
     ema_model = deepcopy(model)
-
-    print("start loading checkpoint")
     
     model, ema_model = FSDPCheckpoint.try_load_ckpt(
         resume_from, logger, model, ema_model, resume_from_ema=finetune_from_ema
@@ -616,7 +614,10 @@ def main():
             resume_from, optimizer, scheduler, fsdp_config, 
         )
 
-    
+    # Setup packed dataloader
+    with open(data_args.dataset_config_file, "r") as stream:
+        dataset_meta = yaml.safe_load(stream)
+    dataset_config = DataConfig(grouped_datasets=dataset_meta)
     if training_args.visual_und:
         dataset_config.vit_patch_size = model_args.vit_patch_size
         dataset_config.max_num_patch_per_side = model_args.vit_max_num_patch_per_side

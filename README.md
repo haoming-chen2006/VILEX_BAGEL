@@ -1,6 +1,6 @@
 ## VILEX_Structure
 
-![Vilex Poster](/home/haoming/Bagel/vilex_poster.png)
+![Vilex Poster][/vilex_poster.jpg)
 
 A quick visual summary of the Vilex integration and BAGEL packing.
 
